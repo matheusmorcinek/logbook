@@ -55,16 +55,19 @@ func dataDir() string {
 	if d := os.Getenv("LOGBOOK_DIR"); d != "" {
 		return d
 	}
-	return "/Users/Shared/logbook"
+	return "/Library/Application Support/logbook"
 }
 
 func dataPath(name string) string { return filepath.Join(dataDir(), name) }
 
-// prepareDataDir creates the data directory. Recorded command lines can contain sensitive values,
-// so when running as root the data is made readable by admin users only (group admin, gid 80);
-// files created inside inherit the directory's group.
+// prepareDataDir creates the data directory. When running as root the data is made readable by
+// admin users only (group admin, gid 80); files created inside inherit the directory's group.
+// Symlinks are refused so root never changes ownership of something else.
 func prepareDataDir() error {
 	dir := dataDir()
+	if fi, err := os.Lstat(dir); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; refusing to use it", dir)
+	}
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
@@ -82,8 +85,11 @@ func prepareDataDir() error {
 		return err
 	}
 	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
 		p := filepath.Join(dir, e.Name())
-		_ = os.Chown(p, 0, 80)
+		_ = os.Lchown(p, 0, 80)
 		_ = os.Chmod(p, 0o640)
 	}
 	return nil
@@ -94,7 +100,8 @@ type Config struct {
 	// to decide which processes are "the MDM agent".
 	Watch           []string `json:"watch"`
 	SnapshotMinutes int      `json:"snapshot_minutes"`
-	AIModel         string   `json:"ai_model"`
+	RetentionDays   int      `json:"retention_days"`
+	KeepRawMDMLog   bool     `json:"keep_raw_mdm_log"`
 }
 
 // Common MDM agents, matched against executable paths and signing IDs. Edit config.json to change.
@@ -105,6 +112,7 @@ func defaultConfig() Config {
 	return Config{
 		Watch:           defaultWatch,
 		SnapshotMinutes: 10,
+		RetentionDays:   30,
 	}
 }
 
@@ -123,6 +131,9 @@ func loadConfig() Config {
 	}
 	if cfg.SnapshotMinutes <= 0 {
 		cfg.SnapshotMinutes = 10
+	}
+	if cfg.RetentionDays <= 0 {
+		cfg.RetentionDays = 30
 	}
 	return cfg
 }
@@ -152,6 +163,41 @@ func (s *Store) Emit(evs ...Event) {
 		if err := enc.Encode(ev); err != nil {
 			log.Printf("events: %v", err)
 		}
+	}
+}
+
+// prune drops events older than the retention period.
+func (s *Store) prune(days int, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := dataPath(eventsFile)
+	evs, err := readEvents(path)
+	if err != nil {
+		return
+	}
+	cutoff := now.AddDate(0, 0, -days)
+	keep := evs[:0]
+	for _, ev := range evs {
+		if ev.Time.After(cutoff) {
+			keep = append(keep, ev)
+		}
+	}
+	if len(keep) == len(evs) {
+		return
+	}
+	var b strings.Builder
+	for _, ev := range keep {
+		data, _ := json.Marshal(ev)
+		b.Write(data)
+		b.WriteByte('\n')
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o640); err != nil {
+		log.Printf("prune: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		log.Printf("prune: %v", err)
 	}
 }
 

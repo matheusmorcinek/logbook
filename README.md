@@ -22,10 +22,10 @@ Configuration profiles are explained in plain language, including privacy permis
 
 ## Privacy
 
-- Everything stays on the Mac, in `/Users/Shared/logbook`, readable by admin users only.
-- Nothing is sent anywhere, except when you press `s` or `d` in the UI: that sends the selected
-  entries to Claude through your own [Claude Code](https://claude.com/claude-code) login, to
-  explain them.
+- Nothing leaves the Mac. logbook makes no network connections.
+- History is stored in `/Library/Application Support/logbook`, readable by admin users only, and
+  entries older than 30 days are deleted automatically.
+- Passwords, tokens and keys in command lines and settings are masked before anything is stored.
 
 ## Install
 
@@ -73,8 +73,7 @@ logbook
 | `1`-`5`, `tab` | Timeline, MDM, Processes, Inventory, Profiles |
 | `/` | filter |
 | `!` | important entries only |
-| `s` | ask Claude to explain the selected entry |
-| `d` | ask Claude to summarize today |
+| `y` | copy the selected entry to the clipboard |
 | `?` | help |
 | `q` | quit |
 
@@ -83,13 +82,15 @@ worth knowing, gray is routine. The service records continuously; the UI is only
 
 ## Configure
 
-`/Users/Shared/logbook/config.json` (edit with `sudo`, then `sudo logbook install` to restart):
+`/Library/Application Support/logbook/config.json` (edit with `sudo`, then `sudo logbook install`
+to restart):
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `watch` | common MDM agents | substrings matched against executable paths and signing IDs |
 | `snapshot_minutes` | `10` | how often a full snapshot runs |
-| `ai_model` | empty | model passed to `claude --model`; empty uses your Claude Code default |
+| `retention_days` | `30` | how long history is kept |
+| `keep_raw_mdm_log` | `false` | also save every raw `mdmclient` log line to `mdm-raw.log` |
 
 ## Uninstall
 
@@ -103,8 +104,10 @@ Then remove `logbook` from Full Disk Access in System Settings.
 ## Limitations
 
 - macOS does not document the wording of `mdmclient` log messages, so commands are recognized by
-  their protocol names (`InstallProfile`, `DeviceLock`, ...). Raw lines are kept in
-  `mdm-raw.log` to improve matching.
+  their protocol names (`InstallProfile`, `DeviceLock`, ...). Turn on `keep_raw_mdm_log` to see
+  the raw lines and improve matching.
+- Secret masking is best effort: it recognizes common patterns (password and token flags,
+  authorization headers, credentials in URLs, long opaque keys), not every possible secret.
 - `eslogger` output is not a stable API; Apple may change it between macOS releases.
 - Anything running as root, including an MDM agent, could stop logbook or edit its files. A gap is
   flagged the next time logbook starts.

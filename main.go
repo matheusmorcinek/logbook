@@ -193,10 +193,6 @@ func runStatus() {
 		fmt.Println(ok(st.MDMLog == "running", "MDM command log: "+st.MDMLog))
 		fmt.Println(ok(st.Process == "running", "process tracking: "+st.Process))
 	}
-	if _, err := findClaude(); err != nil {
-		fmt.Println("info  " + err.Error() + " (only needed for the s / d explanations)")
-	} else {
-		fmt.Println("ok    Claude Code found (used for s / d explanations)")
-	}
-	fmt.Println("data  " + dataDir())
+	cfg := loadConfig()
+	fmt.Printf("data  %s (history kept %d days)\n", dataDir(), cfg.RetentionDays)
 }

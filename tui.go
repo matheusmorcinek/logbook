@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -82,31 +84,24 @@ type model struct {
 	expanded    bool
 	dscroll     int
 	help        bool
-	ai          aiCache
-	busy        map[string]time.Time
-	aiErr       map[string]string
-	summary     string
 	lastVisit   time.Time
 	newCount    int
 	stamps      map[string]string
-	aiModel     string
 	host        string
 	loadErr     string
+	flash       string
+	flashUntil  time.Time
 }
 
 type tickMsg time.Time
-type aiMsg struct {
-	key, text string
-	err       error
-}
+type copiedMsg struct{ err error }
 
 func newModel() *model {
 	ti := textinput.New()
 	ti.Prompt = "/ "
 	ti.Placeholder = "filter"
 	ti.CharLimit = 80
-	m := &model{filter: ti, ai: loadAICache(), busy: map[string]time.Time{}, aiErr: map[string]string{},
-		lastVisit: loadSeen().LastVisit, stamps: map[string]string{}, aiModel: loadConfig().AIModel,
+	m := &model{filter: ti, lastVisit: loadSeen().LastVisit, stamps: map[string]string{},
 		host: computerName(), w: 100, h: 30}
 	if _, err := os.ReadDir(dataDir()); err != nil && os.IsPermission(err) {
 		m.loadErr = "No permission to read " + dataDir() + ". Recorded data is readable by admin users only."
@@ -115,6 +110,31 @@ func newModel() *model {
 	m.buildRows()
 	return m
 }
+
+func userCachePath(name string) string {
+	dir := os.Getenv("LOGBOOK_CACHE_DIR")
+	if dir == "" {
+		base, err := os.UserCacheDir()
+		if err != nil {
+			base = os.TempDir()
+		}
+		dir = filepath.Join(base, "logbook")
+	}
+	_ = os.MkdirAll(dir, 0o700)
+	return filepath.Join(dir, name)
+}
+
+type seenState struct {
+	LastVisit time.Time `json:"last_visit"`
+}
+
+func loadSeen() seenState {
+	var s seenState
+	_ = readJSON(userCachePath("seen.json"), &s)
+	return s
+}
+
+func saveSeen(t time.Time) { _ = writeJSONAtomic(userCachePath("seen.json"), seenState{LastVisit: t}) }
 
 func computerName() string {
 	if out, err := run("/usr/sbin/scutil", "--get", "ComputerName"); err == nil && strings.TrimSpace(out) != "" {
@@ -285,7 +305,7 @@ func (m *model) layout() (listH, detailH int) {
 		avail--
 	}
 	detailH = avail / 3
-	if m.expanded || m.help || m.summary != "" {
+	if m.expanded || m.help {
 		detailH = avail * 2 / 3
 	}
 	if detailH < 5 {
@@ -326,7 +346,6 @@ func (m *model) clamp() {
 func (m *model) move(n int) {
 	m.cursor += n
 	m.dscroll = 0
-	m.summary = ""
 	m.clamp()
 }
 
@@ -340,14 +359,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.buildRows()
 		}
 		return m, tick()
-	case aiMsg:
-		delete(m.busy, msg.key)
+	case copiedMsg:
+		m.flash, m.flashUntil = "Copied to clipboard", time.Now().Add(3*time.Second)
 		if msg.err != nil {
-			m.aiErr[msg.key] = msg.err.Error()
-		} else {
-			delete(m.aiErr, msg.key)
-			m.ai[msg.key] = msg.text
-			m.ai.save()
+			m.flash = "Could not copy: " + msg.err.Error()
 		}
 	case tea.KeyMsg:
 		return m.key(msg)
@@ -412,8 +427,6 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch {
 		case m.help:
 			m.help = false
-		case m.summary != "":
-			m.summary = ""
 		case m.expanded:
 			m.expanded = false
 		case m.filter.Value() != "":
@@ -435,100 +448,28 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.stamps = map[string]string{}
 		m.reload()
 		m.buildRows()
-	case "s":
-		return m, m.explain()
-	case "d":
-		return m, m.daySummary()
+	case "y":
+		return m, m.copySelected()
 	}
 	return m, nil
 }
 
 func (m *model) setTab(t int) {
-	m.tab, m.cursor, m.top, m.dscroll, m.summary = t, 0, 0, 0, ""
+	m.tab, m.cursor, m.top, m.dscroll = t, 0, 0, 0
 	m.buildRows()
 }
 
-func (m *model) explain() tea.Cmd {
+// copySelected puts the selected entry on the clipboard as plain text, ready to paste anywhere.
+func (m *model) copySelected() tea.Cmd {
 	if m.cursor >= len(m.rows) {
 		return nil
 	}
 	r := m.rows[m.cursor]
-	m.summary, m.help = "", false
-	delete(m.aiErr, r.key)
-	if _, ok := m.ai[r.key]; ok {
-		return nil
-	}
-	if _, ok := m.busy[r.key]; ok {
-		return nil
-	}
-	m.busy[r.key] = time.Now()
-	prompt, model := explainPrompt(r, m.contextFor(r)), m.aiModel
+	text := fmt.Sprintf("%s\n%s · %s · %s\n\n%s\n", r.title, r.when(), r.kind, r.sev, r.detail)
 	return func() tea.Msg {
-		text, err := askClaude(prompt, model)
-		return aiMsg{r.key, text, err}
-	}
-}
-
-// contextFor returns up to 10 other events close in time to an event row.
-func (m *model) contextFor(r row) []row {
-	if r.evID == "" {
-		return nil
-	}
-	var near []Event
-	for _, ev := range m.events {
-		d := ev.Time.Sub(r.t)
-		if ev.ID != r.evID && d > -30*time.Minute && d < 30*time.Minute {
-			near = append(near, ev)
-		}
-	}
-	sort.Slice(near, func(i, j int) bool { return absDur(near[i].Time.Sub(r.t)) < absDur(near[j].Time.Sub(r.t)) })
-	if len(near) > 10 {
-		near = near[:10]
-	}
-	sort.Slice(near, func(i, j int) bool { return near[i].Time.Before(near[j].Time) })
-	out := make([]row, len(near))
-	for i, ev := range near {
-		out[i] = m.eventRow(ev)
-	}
-	return out
-}
-
-func absDur(d time.Duration) time.Duration {
-	if d < 0 {
-		return -d
-	}
-	return d
-}
-
-func (m *model) daySummary() tea.Cmd {
-	now := time.Now()
-	y, mo, d := now.Date()
-	start := time.Date(y, mo, d, 0, 0, 0, 0, now.Location())
-	var rows []row
-	for i := len(m.events) - 1; i >= 0 && len(rows) < 400; i-- {
-		if ev := m.events[i]; ev.Time.After(start) && ev.Source != "logbook" {
-			rows = append(rows, m.eventRow(ev))
-		}
-	}
-	key := fmt.Sprintf("day:%s:%d", start.Format("2006-01-02"), len(rows))
-	m.summary, m.help = key, false
-	m.clamp()
-	delete(m.aiErr, key)
-	if len(rows) == 0 {
-		m.ai[key] = "Nothing was recorded today yet."
-		return nil
-	}
-	if _, ok := m.ai[key]; ok {
-		return nil
-	}
-	if _, ok := m.busy[key]; ok {
-		return nil
-	}
-	m.busy[key] = now
-	prompt, model := summaryPrompt(start, rows), m.aiModel
-	return func() tea.Msg {
-		text, err := askClaude(prompt, model)
-		return aiMsg{key, text, err}
+		cmd := exec.Command("/usr/bin/pbcopy")
+		cmd.Stdin = strings.NewReader(text)
+		return copiedMsg{cmd.Run()}
 	}
 }
 
@@ -694,9 +635,6 @@ func (m *model) viewDetail(h int) string {
 	switch {
 	case m.help:
 		label, body = " keys ", helpText
-	case m.summary != "":
-		label = " today's summary · Claude "
-		body = m.aiBody(m.summary, "Summarizing today's activity with Claude…")
 	case m.cursor < len(m.rows):
 		r := m.rows[m.cursor]
 		var b strings.Builder
@@ -712,18 +650,7 @@ func (m *model) viewDetail(h int) string {
 			meta += " · " + sNew.Render("new")
 		}
 		b.WriteString(sDim.Render(meta) + "\n\n")
-		_, asked := m.ai[r.key]
-		_, busy := m.busy[r.key]
-		_, failed := m.aiErr[r.key]
-		if asked || busy || failed {
-			b.WriteString(sSection.Render("Claude") + "\n")
-			b.WriteString(m.aiBody(r.key, "Asking Claude to explain this entry…") + "\n\n")
-			b.WriteString(sSection.Render("Details") + "\n")
-			b.WriteString(r.detail)
-		} else {
-			b.WriteString(r.detail + "\n\n")
-			b.WriteString(sDim.Render("Press s to ask Claude to explain this entry."))
-		}
+		b.WriteString(r.detail)
 		body = b.String()
 	default:
 		body = sDim.Render("Select an entry to see its details.")
@@ -757,21 +684,11 @@ func (m *model) viewDetail(h int) string {
 	return out
 }
 
-func (m *model) aiBody(key, waiting string) string {
-	if text, ok := m.ai[key]; ok {
-		return text
-	}
-	if started, ok := m.busy[key]; ok {
-		return sDim.Render(fmt.Sprintf("%s %ds", waiting, int(time.Since(started).Seconds())))
-	}
-	if err, ok := m.aiErr[key]; ok {
-		return lipgloss.NewStyle().Foreground(cAlert).Render(err)
-	}
-	return ""
-}
-
 func (m *model) viewFooter() string {
-	keys := [][2]string{{"↑↓", "move"}, {"enter", "expand"}, {"s", "explain"}, {"d", "today"}, {"/", "filter"}, {"?", "help"}, {"q", "quit"}, {"!", "important"}, {"1-5", "tabs"}}
+	if m.flash != "" && time.Now().Before(m.flashUntil) {
+		return pad(" "+lipgloss.NewStyle().Foreground(cOK).Render("✓ "+m.flash), m.w)
+	}
+	keys := [][2]string{{"↑↓", "move"}, {"enter", "expand"}, {"y", "copy"}, {"/", "filter"}, {"?", "help"}, {"q", "quit"}, {"!", "important"}, {"1-5", "tabs"}}
 	sep := sFaint.Render(" · ")
 	line := ""
 	for _, k := range keys {
@@ -792,8 +709,7 @@ pgup pgdn      page              J K        scroll the details
 g G            first / last      esc        close / clear
 1-5 tab ← →    switch tabs       /          filter (type, enter to keep, esc to clear)
 !              important only    r          reload now
-s              ask Claude to explain the selected entry (answers are cached)
-d              ask Claude to summarize today's activity
+y              copy the selected entry to the clipboard (to paste anywhere)
 q              quit (everything until now is marked as seen)
 
 Tabs: Timeline is everything. MDM shows commands the server sent. Processes shows

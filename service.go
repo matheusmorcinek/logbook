@@ -25,8 +25,8 @@ func runService() {
 		log.Fatal(err)
 	}
 	cfg := loadConfig()
-	rotateIfLarge(dataPath(eventsFile), 50<<20)
 	store := &Store{}
+	store.prune(cfg.RetentionDays, time.Now())
 
 	var prev Status
 	_ = readJSON(dataPath(statusFile), &prev)
@@ -61,15 +61,20 @@ func runService() {
 	st.update(func(s *Status) { s.Stopped = true; s.Heartbeat = time.Now() })
 }
 
-func heartbeatLoop(ctx context.Context, _ Config, _ *Store, st *statusTracker) {
+func heartbeatLoop(ctx context.Context, cfg Config, store *Store, st *statusTracker) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
+	lastPrune := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			st.update(func(s *Status) { s.Heartbeat = time.Now() })
+		case now := <-t.C:
+			st.update(func(s *Status) { s.Heartbeat = now })
+			if now.Sub(lastPrune) >= time.Hour {
+				store.prune(cfg.RetentionDays, now)
+				lastPrune = now
+			}
 		}
 	}
 }
@@ -205,10 +210,10 @@ func (p *mdmParser) parse(l logLine) *Event {
 	inf := mdmCommands[cmd]
 	return &Event{Time: t, Source: "mdm", Kind: "command", Action: "received", Severity: inf.Sev,
 		Title:  fmt.Sprintf("MDM: %s - %s", cmd, inf.Desc),
-		Detail: fmt.Sprintf("Command: %s\nMeaning: %s\n\nLog message (%s):\n%s", cmd, inf.Desc, filepath.Base(l.Process), l.Message)}
+		Detail: fmt.Sprintf("Command: %s\nMeaning: %s\n\nLog message (%s):\n%s", cmd, inf.Desc, filepath.Base(l.Process), redact(l.Message))}
 }
 
-func mdmLogLoop(ctx context.Context, _ Config, store *Store, st *statusTracker) {
+func mdmLogLoop(ctx context.Context, cfg Config, store *Store, st *statusTracker) {
 	p := &mdmParser{}
 	for ctx.Err() == nil {
 		cmd := exec.CommandContext(ctx, "/usr/bin/log", "stream", "--style", "ndjson", "--level", "info",
@@ -227,7 +232,10 @@ func mdmLogLoop(ctx context.Context, _ Config, store *Store, st *statusTracker) 
 			continue
 		}
 		st.update(func(s *Status) { s.MDMLog = "running" })
-		raw := openRaw()
+		var raw io.WriteCloser
+		if cfg.KeepRawMDMLog {
+			raw = openRaw()
+		}
 		sc := bufio.NewScanner(out)
 		sc.Buffer(make([]byte, 1<<20), 8<<20)
 		for sc.Scan() {
@@ -236,7 +244,7 @@ func mdmLogLoop(ctx context.Context, _ Config, store *Store, st *statusTracker) 
 				continue
 			}
 			if raw != nil {
-				fmt.Fprintf(raw, "%s %s: %s\n", l.Timestamp, filepath.Base(l.Process), l.Message)
+				fmt.Fprintf(raw, "%s %s: %s\n", l.Timestamp, filepath.Base(l.Process), redact(l.Message))
 			}
 			if ev := p.parse(l); ev != nil {
 				store.Emit(*ev)
@@ -257,7 +265,7 @@ func mdmLogLoop(ctx context.Context, _ Config, store *Store, st *statusTracker) 
 	}
 }
 
-// The raw mdmclient log is kept so the command matching can be tuned against real output.
+// The raw mdmclient log (opt-in) helps tune command matching against real output.
 func openRaw() io.WriteCloser {
 	path := dataPath(mdmRawFile)
 	rotateIfLarge(path, 20<<20)
@@ -318,10 +326,21 @@ func newTracker(patterns []string) *tracker {
 	return &tracker{patterns: lower, watched: map[int]string{}, lastCmd: map[string]time.Time{}}
 }
 
+// Paths under these folders belong to users, not to installed agents, so a folder that happens to
+// be called "rippling" is not mistaken for one.
+var userPathPrefixes = []string{"/Users/", "/private/tmp/", "/tmp/", "/private/var/folders/", "/Volumes/"}
+
 func (t *tracker) matches(p esProcess) bool {
-	s := strings.ToLower(p.Executable.Path + " " + p.SigningID)
+	id := strings.ToLower(p.SigningID)
+	path := strings.ToLower(p.Executable.Path)
+	for _, pre := range userPathPrefixes {
+		if strings.HasPrefix(path, strings.ToLower(pre)) {
+			path = ""
+			break
+		}
+	}
 	for _, pat := range t.patterns {
-		if pat != "" && strings.Contains(s, pat) {
+		if pat != "" && (strings.Contains(id, pat) || strings.Contains(path, pat)) {
 			return true
 		}
 	}
@@ -379,7 +398,7 @@ func (t *tracker) handle(m esMessage, now time.Time) *Event {
 				Title: "Agent started: " + name, Detail: processDetail(m, name)}
 		}
 		t.watched[pid] = r
-		cmdline := strings.Join(x.Args, " ")
+		cmdline := redact(strings.Join(x.Args, " "))
 		if cmdline == "" {
 			cmdline = x.Target.Executable.Path
 		}
@@ -426,7 +445,7 @@ func processDetail(m esMessage, root string) string {
 	fmt.Fprintf(&b, "Started by: %s\n", root)
 	fmt.Fprintf(&b, "Program: %s\n", x.Target.Executable.Path)
 	if len(x.Args) > 0 {
-		fmt.Fprintf(&b, "Command: %s\n", strings.Join(x.Args, " "))
+		fmt.Fprintf(&b, "Command: %s\n", redact(strings.Join(x.Args, " ")))
 	}
 	user := fmt.Sprintf("uid %d", x.Target.AuditToken.EUID)
 	if x.Target.AuditToken.EUID == 0 {

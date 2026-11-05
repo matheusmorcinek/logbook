@@ -355,7 +355,7 @@ func describeLaunchd(data []byte) string {
 		for _, a := range args {
 			parts = append(parts, fmt.Sprint(a))
 		}
-		fmt.Fprintf(&b, "Runs: %s\n", strings.Join(parts, " "))
+		fmt.Fprintf(&b, "Runs: %s\n", redact(strings.Join(parts, " ")))
 	}
 	for _, k := range []string{"RunAtLoad", "KeepAlive", "StartInterval", "UserName"} {
 		if v, ok := p[k]; ok {
@@ -487,7 +487,11 @@ func flatten(prefix string, v any, limit int) []string {
 		case []byte:
 			out = append(out, fmt.Sprintf("%s = <%d bytes>", p, len(t)))
 		default:
-			out = append(out, fmt.Sprintf("%s = %s", p, truncate(fmt.Sprint(t), 120)))
+			val := redact(truncate(fmt.Sprint(t), 120))
+			if isSecretKey(p) {
+				val = masked
+			}
+			out = append(out, fmt.Sprintf("%s = %s", p, val))
 		}
 	}
 	walk(prefix, v)

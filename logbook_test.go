@@ -254,13 +254,59 @@ func TestLaunchdPlistIsValid(t *testing.T) {
 	}
 }
 
-func TestPromptsAreNeutral(t *testing.T) {
-	r := row{t: time.Now(), sev: "info", kind: "Process", title: "x ran: ls"}
-	for _, p := range []string{explainPrompt(r, nil), summaryPrompt(time.Now(), []row{r})} {
-		for _, word := range []string{"MDM", "Rippling", "employer", "owner"} {
-			if strings.Contains(p, word) {
-				t.Errorf("prompt mentions %q:\n%s", word, p)
-			}
+func TestRedact(t *testing.T) {
+	cases := map[string]string{
+		"sysadminctl -addUser it-admin -password Hunter2! -admin": "sysadminctl -addUser it-admin -password ‹hidden› -admin",
+		"sysadminctl -adminPassword=S3cret -resetPasswordFor bob": "sysadminctl -adminPassword=‹hidden› -resetPasswordFor bob",
+		"dscl . -passwd /Users/bob oldpw newpw":                   "dscl . -passwd /Users/bob ‹hidden›",
+		"security unlock-keychain -p hunter2 login.keychain":      "security unlock-keychain -p ‹hidden› login.keychain",
+		"curl -H Authorization: Bearer abc.def.ghi https://x.io":  "curl -H Authorization: ‹hidden› https://x.io",
+		"curl https://user:pa55@example.com/api?token=xyz&a=1":    "curl https://user:‹hidden›@example.com/api?token=‹hidden›&a=1",
+		"agent --api-key sk_live_1234 --verbose":                  "agent --api-key ‹hidden› --verbose",
+		"enroll aGVsbG8td29ybGQtdGhpcy1pcy1hLWxvbmctdG9rZW4tMTIz": "enroll ‹hidden›",
+		"installer -pkg /tmp/GoogleChrome.pkg -target /":          "installer -pkg /tmp/GoogleChrome.pkg -target /",
+		"security add-generic-password -a me -s svc -w topsecret": "security add-generic-password -a me -s svc -w ‹hidden›",
+		"mkdir -p /Library/Application Support/Agent":             "mkdir -p /Library/Application Support/Agent",
+	}
+	for in, want := range cases {
+		if got := redact(in); got != want {
+			t.Errorf("redact(%q)\n got %q\nwant %q", in, got, want)
 		}
+	}
+	if !isSecretKey("PayloadContent.Password") || !isSecretKey("Services[0].Challenge") || isSecretKey("PayloadContent.SSID_STR") {
+		t.Error("isSecretKey")
+	}
+	lines := flatten("", map[string]any{"SSID_STR": "Office", "Password": "wifi-pass"}, 10)
+	if strings.Join(lines, "\n") != "Password = ‹hidden›\nSSID_STR = Office" {
+		t.Errorf("flatten: %v", lines)
+	}
+}
+
+func TestUserFoldersAreNotAgents(t *testing.T) {
+	tr := newTracker([]string{"rippling"})
+	var p esProcess
+	p.Executable.Path = "/Users/me/code/rippling-tools/bin/build"
+	if tr.matches(p) {
+		t.Error("a user folder named rippling must not count as an agent")
+	}
+	p.Executable.Path = "/Library/Application Support/Rippling/agent"
+	if !tr.matches(p) {
+		t.Error("installed agent path should match")
+	}
+	p.Executable.Path, p.SigningID = "/Users/me/x", "com.rippling.agent"
+	if !tr.matches(p) {
+		t.Error("signing ID should match anywhere")
+	}
+}
+
+func TestPrune(t *testing.T) {
+	t.Setenv("LOGBOOK_DIR", t.TempDir())
+	now := time.Now()
+	s := &Store{}
+	s.Emit(Event{Time: now.AddDate(0, 0, -40), Title: "old"}, Event{Time: now.AddDate(0, 0, -1), Title: "recent"})
+	s.prune(30, now)
+	evs, err := readEvents(dataPath(eventsFile))
+	if err != nil || len(evs) != 1 || evs[0].Title != "recent" {
+		t.Fatalf("got %+v %v", evs, err)
 	}
 }
