@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -27,7 +26,7 @@ func runService() {
 	}
 	cfg := loadConfig()
 	rotateIfLarge(dataPath(eventsFile), 50<<20)
-	store := &Store{notify: newNotifier(cfg)}
+	store := &Store{}
 
 	var prev Status
 	_ = readJSON(dataPath(statusFile), &prev)
@@ -487,39 +486,5 @@ func processLoop(ctx context.Context, cfg Config, store *Store, st *statusTracke
 		if !sleepCtx(ctx, 30*time.Second) {
 			return
 		}
-	}
-}
-
-// ---- phone alerts ----
-
-func newNotifier(cfg Config) func(Event) {
-	if cfg.NtfyTopic == "" {
-		return nil
-	}
-	minRank := sevRank(cfg.NotifyMin)
-	host, _ := os.Hostname()
-	client := &http.Client{Timeout: 15 * time.Second}
-	url := strings.TrimRight(cfg.NtfyServer, "/") + "/" + cfg.NtfyTopic
-	return func(ev Event) {
-		if sevRank(ev.Severity) < minRank || ev.Source == "logbook" && ev.Kind == "service" && ev.Severity == "info" {
-			return
-		}
-		go func() {
-			req, err := http.NewRequest("POST", url, strings.NewReader(ev.Title+"\n\n"+truncate(ev.Detail, 400)))
-			if err != nil {
-				return
-			}
-			req.Header.Set("Title", "logbook on "+host)
-			if ev.Severity == "alert" {
-				req.Header.Set("Priority", "high")
-				req.Header.Set("Tags", "warning")
-			}
-			resp, err := client.Do(req)
-			if err != nil {
-				log.Printf("ntfy: %v", err)
-				return
-			}
-			resp.Body.Close()
-		}()
 	}
 }

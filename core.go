@@ -94,9 +94,6 @@ type Config struct {
 	// to decide which processes are "the MDM agent".
 	Watch           []string `json:"watch"`
 	SnapshotMinutes int      `json:"snapshot_minutes"`
-	NtfyTopic       string   `json:"ntfy_topic"`
-	NtfyServer      string   `json:"ntfy_server"`
-	NotifyMin       string   `json:"notify_min"`
 	AIModel         string   `json:"ai_model"`
 }
 
@@ -108,8 +105,6 @@ func defaultConfig() Config {
 	return Config{
 		Watch:           defaultWatch,
 		SnapshotMinutes: 10,
-		NtfyServer:      "https://ntfy.sh",
-		NotifyMin:       "alert",
 	}
 }
 
@@ -129,16 +124,12 @@ func loadConfig() Config {
 	if cfg.SnapshotMinutes <= 0 {
 		cfg.SnapshotMinutes = 10
 	}
-	if cfg.NtfyServer == "" {
-		cfg.NtfyServer = "https://ntfy.sh"
-	}
 	return cfg
 }
 
 type Store struct {
-	mu     sync.Mutex
-	seq    uint64
-	notify func(Event)
+	mu  sync.Mutex
+	seq uint64
 }
 
 func (s *Store) Emit(evs ...Event) {
@@ -160,9 +151,6 @@ func (s *Store) Emit(evs ...Event) {
 		ev.ID = fmt.Sprintf("%d-%d", ev.Time.UnixNano(), s.seq)
 		if err := enc.Encode(ev); err != nil {
 			log.Printf("events: %v", err)
-		}
-		if s.notify != nil {
-			s.notify(*ev)
 		}
 	}
 }

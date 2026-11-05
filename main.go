@@ -198,11 +198,5 @@ func runStatus() {
 	} else {
 		fmt.Println("ok    Claude Code found (used for s / d explanations)")
 	}
-	cfg := loadConfig()
-	if cfg.NtfyTopic == "" {
-		fmt.Println("info  phone alerts off (set ntfy_topic in " + dataPath(configFile) + ")")
-	} else {
-		fmt.Println("ok    phone alerts to ntfy topic " + cfg.NtfyTopic + " for " + cfg.NotifyMin + " and above")
-	}
 	fmt.Println("data  " + dataDir())
 }

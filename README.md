@@ -23,10 +23,9 @@ Configuration profiles are explained in plain language, including privacy permis
 ## Privacy
 
 - Everything stays on the Mac, in `/Users/Shared/logbook`, readable by admin users only.
-- Nothing is sent anywhere unless you opt in:
-  - pressing `s` or `d` in the UI sends the selected entries to Claude through your own
-    [Claude Code](https://claude.com/claude-code) login, to explain them;
-  - phone alerts send entry titles to the [ntfy](https://ntfy.sh) server you configure.
+- Nothing is sent anywhere, except when you press `s` or `d` in the UI: that sends the selected
+  entries to Claude through your own [Claude Code](https://claude.com/claude-code) login, to
+  explain them.
 
 ## Install
 
@@ -90,9 +89,6 @@ worth knowing, gray is routine. The service records continuously; the UI is only
 | --- | --- | --- |
 | `watch` | common MDM agents | substrings matched against executable paths and signing IDs |
 | `snapshot_minutes` | `10` | how often a full snapshot runs |
-| `ntfy_topic` | empty (off) | ntfy topic for phone alerts; pick a long random name, topics are public |
-| `ntfy_server` | `https://ntfy.sh` | ntfy server |
-| `notify_min` | `alert` | lowest severity sent as an alert (`notice` or `alert`) |
 | `ai_model` | empty | model passed to `claude --model`; empty uses your Claude Code default |
 
 ## Uninstall
@@ -111,7 +107,7 @@ Then remove `logbook` from Full Disk Access in System Settings.
   `mdm-raw.log` to improve matching.
 - `eslogger` output is not a stable API; Apple may change it between macOS releases.
 - Anything running as root, including an MDM agent, could stop logbook or edit its files. A gap is
-  flagged the next time logbook starts, and phone alerts copy entries off the Mac as they happen.
+  flagged the next time logbook starts.
 
 ## Develop
 
