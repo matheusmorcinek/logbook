@@ -10,9 +10,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: test -z "$(gofmt -l .)"
-      - run: go vet ./...
-      - run: go test ./...
+      - run: brew install shellcheck
+      - run: shellcheck logbook test.sh
+      - run: ./test.sh

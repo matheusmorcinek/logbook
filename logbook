@@ -1,0 +1,372 @@
+#!/bin/bash
+# Shows which permissions, profiles, background services, system extensions and apps changed on
+# this Mac since the last check. It changes nothing on the system except its own saved results.
+set -u
+umask 077
+shopt -s nullglob
+
+DIR="${LOGBOOK_DIR:-/Library/Application Support/logbook}"
+ROOT="${LOGBOOK_TEST_ROOT-}"
+ROOT="${ROOT%/}"
+HISTORY_DAYS=30
+
+SECTIONS="permissions profiles services extensions apps"
+
+case "${1:-}" in
+  "") ;;
+  -h | --help)
+    echo "Usage: sudo logbook"
+    echo "Shows what changed on this Mac since the last check."
+    echo "Results are saved in $DIR"
+    exit 0
+    ;;
+  *)
+    echo "Usage: sudo logbook" >&2
+    exit 2
+    ;;
+esac
+
+if [ "$(id -u)" -ne 0 ] && [ -z "${LOGBOOK_TEST_ROOT+x}" ]; then
+  exec sudo "$0" "$@"
+fi
+
+if [ -t 1 ]; then
+  RED=$'\033[31m' YELLOW=$'\033[33m' GRAY=$'\033[90m' BOLD=$'\033[1m' OFF=$'\033[0m'
+else
+  RED="" YELLOW="" GRAY="" BOLD="" OFF=""
+fi
+
+# Reads the profile plist with the macOS built-in JavaScript, so the script has no dependencies.
+# Prints "permissions" and "profiles" lines. Only names and a content hash are kept, never values.
+read -r -d '' PARSE_PROFILES <<'JS'
+ObjC.import('Foundation');
+
+const LABELS = {
+  Accessibility: 'Control the computer (Accessibility)',
+  SystemPolicyAllFiles: 'Full Disk Access (all application data)',
+  SystemPolicySysAdminFiles: 'Access system administration files',
+  SystemPolicyAppData: 'Access other apps\' data',
+  SystemPolicyAppBundles: 'Modify other apps',
+  SystemPolicyDesktopFolder: 'Desktop folder',
+  SystemPolicyDocumentsFolder: 'Documents folder',
+  SystemPolicyDownloadsFolder: 'Downloads folder',
+  ScreenCapture: 'Screen recording',
+  ListenEvent: 'Input monitoring (keyboard)',
+  PostEvent: 'Send keystrokes and clicks',
+  Camera: 'Camera',
+  Microphone: 'Microphone',
+  AppleEvents: 'Control other apps',
+  AddressBook: 'Contacts',
+  Calendar: 'Calendars',
+  Reminders: 'Reminders',
+  Photos: 'Photos',
+};
+
+const TAGS = {
+  'com.apple.security.root': 'trusted root certificate',
+  'com.apple.webcontent-filter': 'web filter',
+  'com.apple.proxy.http.global': 'HTTP proxy',
+  'com.apple.vpn.managed': 'VPN',
+  'com.apple.vpn.managed.applayer': 'VPN',
+  'com.apple.dnsSettings.managed': 'DNS settings',
+  'com.apple.dnsProxy.managed': 'DNS proxy',
+};
+
+const isDict = (o) => o.isKindOfClass($.NSDictionary);
+const isArray = (o) => o.isKindOfClass($.NSArray);
+const clean = (s) => String(s).replace(/\s+/g, ' ').trim();
+
+function get(dict, key) {
+  const value = dict.objectForKey(key);
+  return value.isNil() ? null : value;
+}
+
+function text(dict, key) {
+  const value = get(dict, key);
+  return value === null ? '' : clean(ObjC.unwrap(value));
+}
+
+function children(obj) {
+  const list = isDict(obj) ? obj.allValues : isArray(obj) ? obj : null;
+  const out = [];
+  if (list !== null) {
+    for (let i = 0; i < list.count; i++) out.push(list.objectAtIndex(i));
+  }
+  return out;
+}
+
+function find(obj, match, out) {
+  if (isDict(obj) && match(obj)) {
+    out.push(obj);
+    return out;
+  }
+  children(obj).forEach((child) => find(child, match, out));
+  return out;
+}
+
+function hash(obj) {
+  const data = $.NSPropertyListSerialization.dataWithPropertyListFormatOptionsError(
+    obj, $.NSPropertyListXMLFormat_v1_0, 0, null);
+  const body = data.base64EncodedStringWithOptions(0).js;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < body.length; i++) h = Math.imul(h ^ body.charCodeAt(i), 16777619);
+  return (h >>> 0).toString(16);
+}
+
+function grants(payload, profileName) {
+  const lines = [];
+  find(payload, (d) => get(d, 'Services') !== null, []).forEach((holder) => {
+    const services = get(holder, 'Services');
+    const names = services.allKeys;
+    for (let i = 0; i < names.count; i++) {
+      const service = ObjC.unwrap(names.objectAtIndex(i));
+      const label = LABELS[service] || service;
+      children(get(services, service)).forEach((entry) => {
+        const client = text(entry, 'Identifier');
+        let auth = text(entry, 'Authorization');
+        if (auth === '') auth = text(entry, 'Allowed') === 'true' || text(entry, 'Allowed') === '1' ? 'Allow' : 'Deny';
+        let shown = label + ' blocked';
+        if (auth === 'Allow') shown = label;
+        if (auth === 'AllowStandardUserToSetSystemService') shown = label + ' may be approved by a standard user';
+        lines.push(['permissions', [client, service, profileName].join('|'), auth,
+          shown + ' for ' + client + ' (' + profileName + ')', client, shown, profileName].join('\t'));
+      });
+    }
+  });
+  return lines;
+}
+
+function run(argv) {
+  const data = $.NSData.dataWithContentsOfFile(argv[0]);
+  const root = $.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(data, 0, null, null);
+  if (root.isNil()) throw new Error('could not read the profile list');
+  const lines = [];
+  find(root, (d) => get(d, 'ProfileIdentifier') !== null, []).forEach((profile) => {
+    const id = text(profile, 'ProfileIdentifier');
+    const name = text(profile, 'ProfileDisplayName') || id;
+    const items = get(profile, 'ProfileItems') || $.NSArray.array;
+    const tags = [];
+    children(items).forEach((item) => {
+      const tag = TAGS[text(item, 'PayloadType')];
+      if (tag && !tags.includes(tag)) tags.push(tag);
+      lines.push(...grants(item, name));
+    });
+    const shown = tags.length ? name + ' (contains: ' + tags.join(', ') + ')' : name;
+    lines.push(['profiles', id, hash(items), shown].join('\t'));
+  });
+  return lines.join('\n');
+}
+JS
+
+profile_list() {
+  if [ -f "$ROOT/profiles.xml" ]; then
+    cat "$ROOT/profiles.xml"
+  elif [ "$(id -u)" -eq 0 ]; then
+    /usr/bin/profiles show -all -output stdout-xml
+  else
+    /usr/bin/profiles show -output stdout-xml
+  fi
+}
+
+collect_profiles() {
+  local xml="$1/.profiles.xml" parsed="$1/.parsed"
+  profile_list >"$xml" || return 1
+  /usr/bin/osascript -l JavaScript -e "$PARSE_PROFILES" "$xml" >"$parsed" 2>/dev/null || return 1
+  awk -F'\t' -v OFS='\t' '$1 == "permissions" { $1 = ""; sub(/^\t/, ""); print }' "$parsed" >"$1/permissions.raw"
+  awk -F'\t' -v OFS='\t' '$1 == "profiles" { $1 = ""; sub(/^\t/, ""); print }' "$parsed" >"$1/profiles.raw"
+}
+
+collect_services() {
+  local file
+  for file in "$ROOT"/Library/LaunchDaemons/*.plist "$ROOT"/Library/LaunchAgents/*.plist \
+    "$ROOT"/Users/*/Library/LaunchAgents/*.plist; do
+    printf '%s\t%s\t%s\n' "$file" "$(/usr/bin/shasum -a 256 "$file" | cut -c1-16)" "$file"
+  done
+}
+
+collect_extensions() {
+  local list
+  if [ -f "$ROOT/extensions.txt" ]; then
+    list=$(cat "$ROOT/extensions.txt")
+  else
+    list=$(/usr/bin/systemextensionsctl list) || return 1
+  fi
+  printf '%s\n' "$list" | awk -F'\t' -v OFS='\t' 'NF >= 6 && $1 != "enabled" {
+    bundle = version = $4
+    sub(/ \(.*$/, "", bundle)
+    sub(/^[^(]*\(/, "", version)
+    sub(/\)$/, "", version)
+    print $3 " " bundle, version " " $6, $5 " " version " " $6
+  }'
+}
+
+collect_apps() {
+  local app version name
+  find "$ROOT"/Applications "$ROOT"/Users/*/Applications -maxdepth 3 -type d -name '*.app' -prune 2>/dev/null |
+    while IFS= read -r app; do
+      # plutil prints its errors to stdout, so a failure must not be read as a version.
+      version=$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist" 2>/dev/null) || version=""
+      name=$(basename "$app" .app)
+      printf '%s\t%s\t%s\n' "$app" "$version" "$name${version:+ $version}"
+    done
+}
+
+noun() {
+  case "$1" in
+    permissions) echo "Permission" ;;
+    profiles) echo "Profile" ;;
+    services) echo "Background service" ;;
+    extensions) echo "System extension" ;;
+    apps) echo "App" ;;
+  esac
+}
+
+# Prints "+", "-" or "~" followed by a tab and the description of each difference.
+compare() {
+  awk -F'\t' -v noun="$(noun "$3")" '
+    FILENAME == ARGV[1] { value[$1] = $2; shown[$1] = $3; next }
+    {
+      seen[$1] = 1
+      if (!($1 in value)) print "+\t" noun ": " $3
+      else if (value[$1] != $2) {
+        if (shown[$1] == $3) print "~\t" noun ": " $3 " (content changed)"
+        else print "~\t" noun ": " shown[$1] " → " $3
+      }
+    }
+    END { for (key in value) if (!(key in seen)) print "-\t" noun ": " shown[key] }
+  ' "$1" "$2" | LC_ALL=C sort
+}
+
+hand_check() {
+  echo "Check by hand: System Settings > Privacy & Security"
+  echo "  Screen & System Audio Recording, Input Monitoring"
+}
+
+count() { wc -l <"$1" | tr -d ' '; }
+
+# "1 app", "2 apps"
+amount() {
+  local n
+  n=$(count "$1")
+  if [ "$n" = 1 ]; then echo "$n $2"; else echo "$n $2s"; fi
+}
+
+first_report() {
+  local dir="$1" client="" line
+  echo "First check - saved as the starting point ($(date '+%b %-d, %H:%M'))"
+  echo
+  echo "${BOLD}PERMISSIONS GRANTED BY PROFILES${OFF}"
+  [ -s "$dir/permissions" ] || echo "  none"
+  while IFS=$'\t' read -r _ _ _ who shown profile; do
+    if [ "$who" != "$client" ]; then
+      client="$who"
+      echo "  $client"
+    fi
+    printf '    %-44s %s\n' "$shown" "$profile"
+  done < <(LC_ALL=C sort -t$'\t' -k4,4 -k5,5 "$dir/permissions")
+  echo
+  echo "${BOLD}PROFILES ($(count "$dir/profiles"))${OFF}"
+  [ -s "$dir/profiles" ] || echo "  none"
+  while IFS=$'\t' read -r _ _ line; do echo "  $line"; done < <(LC_ALL=C sort -t$'\t' -k3,3 "$dir/profiles")
+  echo
+  echo "${BOLD}ALSO SAVED${OFF}"
+  echo "  $(amount "$dir/services" "background service"), $(amount "$dir/extensions" "system extension"), $(amount "$dir/apps" "app")"
+  echo
+  hand_check
+}
+
+print_group() {
+  local title="$1" mark="$2" file="$3" color line
+  grep -q "^$mark"$'\t' "$file" || return 0
+  echo "${BOLD}$title${OFF}"
+  while IFS=$'\t' read -r _ line; do
+    color="$YELLOW"
+    [ "$mark" = "-" ] && color="$GRAY"
+    [ "$mark" = "+" ] && [ "${line#Permission: }" != "$line" ] && color="$RED"
+    echo "  ${color}$mark $line${OFF}"
+  done < <(grep "^$mark"$'\t' "$file")
+  echo
+}
+
+if [ -L "$DIR" ]; then
+  echo "logbook: $DIR is a symlink, refusing to use it" >&2
+  exit 1
+fi
+mkdir -p "$DIR/history" || exit 1
+chmod 700 "$DIR" || exit 1
+
+NEW=$(mktemp -d "$DIR/.new.XXXXXX") || exit 1
+trap 'rm -rf "${NEW:?}"' EXIT
+
+LATEST="$DIR/latest"
+FAILED=""
+
+collect_profiles "$NEW" || FAILED="$FAILED permissions profiles"
+for section in services extensions apps; do
+  "collect_$section" >"$NEW/$section.raw" || FAILED="$FAILED $section"
+done
+
+for section in $SECTIONS; do
+  case " $FAILED " in
+    *" $section "*)
+      if [ ! -f "$LATEST/$section" ]; then
+        echo "logbook: could not read $section, nothing was saved" >&2
+        exit 1
+      fi
+      echo "Warning: could not read $section, keeping the previous results" >&2
+      cp "$LATEST/$section" "$NEW/$section"
+      ;;
+    *)
+      LC_ALL=C sort -t$'\t' -k1,1 -u "$NEW/$section.raw" >"$NEW/$section"
+      ;;
+  esac
+done
+rm -f "${NEW:?}"/*.raw "${NEW:?}/.profiles.xml" "${NEW:?}/.parsed"
+
+save() {
+  date '+%b %-d, %H:%M' >"$NEW/.when"
+  rm -rf "${LATEST:?}"
+  mv "$NEW" "$LATEST"
+  trap - EXIT
+}
+
+if [ ! -f "$LATEST/.when" ]; then
+  first_report "$NEW"
+  save
+  exit 0
+fi
+
+WHEN=$(cat "$LATEST/.when")
+CHANGES="$NEW/.changes"
+: >"$CHANGES"
+for section in $SECTIONS; do
+  compare "$LATEST/$section" "$NEW/$section" "$section" >>"$CHANGES"
+done
+
+if [ ! -s "$CHANGES" ]; then
+  echo "Nothing changed since $WHEN."
+  echo
+  hand_check
+  exit 0
+fi
+
+added=$(grep -c '^+' "$CHANGES")
+removed=$(grep -c '^-' "$CHANGES")
+changed=$(grep -c '^~' "$CHANGES")
+
+report() {
+  echo "Compared with $WHEN"
+  echo
+  print_group "NEW" "+" "$CHANGES"
+  print_group "REMOVED" "-" "$CHANGES"
+  print_group "CHANGED" "~" "$CHANGES"
+  echo "$added new, $removed removed, $changed changed. Saved as the new starting point."
+  echo
+  hand_check
+}
+
+report
+RED="" YELLOW="" GRAY="" BOLD="" OFF="" report >"$DIR/history/$(date '+%Y-%m-%d-%H%M%S').txt"
+find "$DIR/history" -type f -mtime +"$HISTORY_DAYS" -delete
+rm -f "${CHANGES:?}"
+save

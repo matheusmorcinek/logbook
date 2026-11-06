@@ -1,126 +1,69 @@
 # logbook
 
-A read-only log of process activity and settings changes on a Mac, with a terminal UI to browse it.
+One command that shows what changed on a Mac since you last ran it: permissions granted by
+configuration profiles, profiles, background services, system extensions and apps.
 
-It is useful on a Mac enrolled in device management (MDM), or any Mac where you want to know what
-changed and what ran: apps and packages installed or removed, configuration profiles and the
-permissions they grant, new users and admins, certificates, background services, and every process
-started by a device management agent.
-
-logbook only observes. It never blocks, modifies or interferes with anything on the Mac.
-
-## What it records
-
-| Area | How |
-| --- | --- |
-| Apps, packages, users, admins, certificates, system extensions, background services, managed preferences, configuration profiles, MDM enrollment status | Snapshots every 10 minutes, and within a minute of an install. Each snapshot is compared with the previous one; additions, removals and changes are logged. |
-| Commands the MDM server sends (install a profile, ask for the app list, lock, erase, ...) | Reads `mdmclient` messages from the unified log. |
-| Every process a device management agent starts, including scripts and their children | macOS Endpoint Security, through Apple's built-in `eslogger`. Agents are matched by name (Rippling, Jamf, Kandji, Mosyle, Intune, Addigy, Hexnode, Workspace ONE, SimpleMDM, Fleet, Meraki by default). |
-
-Configuration profiles are explained in plain language, including privacy permissions they grant
-(for example "GRANTS Full Disk Access to com.example.agent").
-
-## Privacy
-
-- Nothing leaves the Mac. logbook makes no network connections.
-- History is stored in `/Library/Application Support/logbook`, readable by admin users only, and
-  entries older than 30 days are deleted automatically.
-- Passwords, tokens and keys in command lines and settings are masked before anything is stored.
-
-## Install
-
-Requires macOS 13 or later and an admin account.
-
-From source (needs Go 1.24+, for example `brew install go`):
+It is a single shell script with no dependencies and no background service. It doesn't need Full
+Disk Access and makes no network connections. It only changes its own saved results.
 
 ```sh
 git clone https://github.com/matheusmorcinek/logbook
 cd logbook
-go build -o logbook .
-sudo ./logbook install
+sudo ./logbook
 ```
 
-Or download a binary from [Releases](https://github.com/matheusmorcinek/logbook/releases) (built
-by GitHub Actions from the tagged source, with checksums), then:
+The first run saves the current state. Each later run shows the differences and saves the new
+state as the starting point:
+
+```
+Compared with Nov 6, 10:42
+
+NEW
+  + Permission: Screen recording may be approved by a standard user for com.example.agent (Example Agent Profile)
+  + Profile: Example Agent Profile (contains: trusted root certificate)
+  + Background service: /Library/LaunchDaemons/com.example.agent.plist
+  + App: Example Agent 2.1
+
+REMOVED
+  - App: Old Tool 1.0
+
+CHANGED
+  ~ Profile: FileVault (content changed)
+
+4 new, 1 removed, 1 changed. Saved as the new starting point.
+```
+
+To run it from anywhere: `sudo install -m 755 logbook /usr/local/bin/logbook`
+
+## What it can't show
+
+- **Permissions approved on the Mac itself.** macOS protects that list, and reading it needs Full
+  Disk Access. Check **System Settings > Privacy & Security** by hand, especially Screen & System
+  Audio Recording and Input Monitoring.
+- **What a program does with permissions it already has.** Only new or changed items appear.
+- **When something happened, or anything that came and went between two checks.**
+- **Software built to hide.** Anything running as root could conceal itself or edit the saved
+  results. An empty report doesn't prove that nothing is monitoring the Mac.
+
+## Saved data
+
+Results are in `/Library/Application Support/logbook`, readable only by root. They contain names,
+versions and content hashes, never setting values. Reports with changes are kept in `history/` for
+30 days.
+
+To remove it:
 
 ```sh
-xattr -d com.apple.quarantine logbook-darwin-arm64   # downloaded files are quarantined by macOS
-sudo ./logbook-darwin-arm64 install
+sudo rm -rf "/Library/Application Support/logbook"
 ```
-
-`install` copies the binary to `/usr/local/bin/logbook`, starts a background service, and opens
-System Settings at **Full Disk Access**. Add `/usr/local/bin/logbook` there (Cmd+Shift+G to type the
-path) and turn it on; process tracking needs it. Re-grant it after installing a new build, since
-macOS ties the permission to the exact binary.
-
-Check that everything is healthy:
-
-```sh
-logbook status
-```
-
-## Use
-
-```sh
-logbook
-```
-
-| Key | Action |
-| --- | --- |
-| `↑` `↓` / `j` `k` | move |
-| `enter` | expand the details |
-| `J` `K` | scroll the details |
-| `1`-`5`, `tab` | Timeline, MDM, Processes, Inventory, Profiles |
-| `/` | filter |
-| `!` | important entries only |
-| `y` | copy the selected entry to the clipboard |
-| `?` | help |
-| `q` | quit |
-
-Entries since your last visit are marked **NEW**. Colors: red is important to look at, yellow is
-worth knowing, gray is routine. The service records continuously; the UI is only a viewer.
-
-## Configure
-
-`/Library/Application Support/logbook/config.json` (edit with `sudo`, then `sudo logbook install`
-to restart):
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `watch` | common MDM agents | substrings matched against executable paths and signing IDs |
-| `snapshot_minutes` | `10` | how often a full snapshot runs |
-| `retention_days` | `30` | how long history is kept |
-| `keep_raw_mdm_log` | `false` | also save every raw `mdmclient` log line to `mdm-raw.log` |
-
-## Uninstall
-
-```sh
-sudo logbook uninstall           # keeps recorded data
-sudo logbook uninstall --purge   # also deletes it
-```
-
-Then remove `logbook` from Full Disk Access in System Settings.
-
-## Limitations
-
-- macOS does not document the wording of `mdmclient` log messages, so commands are recognized by
-  their protocol names (`InstallProfile`, `DeviceLock`, ...). Turn on `keep_raw_mdm_log` to see
-  the raw lines and improve matching.
-- Secret masking is best effort: it recognizes common patterns (password and token flags,
-  authorization headers, credentials in URLs, long opaque keys), not every possible secret.
-- `eslogger` output is not a stable API; Apple may change it between macOS releases.
-- Anything running as root, including an MDM agent, could stop logbook or edit its files. A gap is
-  flagged the next time logbook starts.
 
 ## Develop
 
 ```sh
-go test ./...
-LOGBOOK_DEMO_DIR=/tmp/lb-demo go test -run TestWriteDemoData . &&
-  LOGBOOK_DIR=/tmp/lb-demo LOGBOOK_CACHE_DIR=/tmp/lb-demo/cache go run .
+./test.sh
 ```
 
-The second command opens the UI on simulated data, without installing anything.
+The tests run against a fake Mac in a temporary folder, so they need no `sudo`.
 
 ## License
 
